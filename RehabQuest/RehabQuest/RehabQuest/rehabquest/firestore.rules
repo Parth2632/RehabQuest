@@ -1,0 +1,137 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helpers
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Signed-in users can read approved therapist profiles in users
+    function isApprovedTherapistDoc() {
+      // Consider both the newer verificationStatus flag and legacy 'verified' boolean
+      return resource.data.userType == 'therapist' &&
+             (resource.data.verificationStatus == 'approved' || resource.data.verified == true);
+    }
+
+    // Therapist <-> Patient pairing (pairId is ${therapistId}_${patientId})
+    function hasPairWith(userId) {
+      return exists(/databases/$(database)/documents/patientTherapistPairs/$(request.auth.uid + '_' + userId)) ||
+             exists(/databases/$(database)/documents/patientTherapistPairs/$(userId + '_' + request.auth.uid));
+    }
+
+    // Community posts - only authenticated users can write
+    match /communityPosts/{document} {
+      allow read: if true;                       // Anyone can read community posts
+      allow write: if isSignedIn();              // Only authenticated users can write
+    }
+
+    // Users collection - users can access their own data;
+    // additionally allow reading approved therapist profiles for signed-in users,
+    // and allow a therapist to read a patient's doc if a pair exists.
+    match /users/{userId} {
+      // Helper validators for required profile fields at creation time
+      function nonEmptyStr(d, f) { return (f in d) && (d[f] is string) && (d[f] != ''); }
+      function patientValidOnCreate(d) {
+        return (d.userType == 'patient') &&
+               nonEmptyStr(d, 'fullName') &&
+               nonEmptyStr(d, 'email') &&
+               (('age' in d) && (d.age is number)) &&
+               nonEmptyStr(d, 'city') &&
+               nonEmptyStr(d, 'bio');
+      }
+      function therapistValidOnCreate(d) {
+        return (d.userType == 'therapist') &&
+               nonEmptyStr(d, 'fullName') &&
+               nonEmptyStr(d, 'email') &&
+               ( (('phone1' in d) && (d.phone1 is string) && (d.phone1 != '')) || (('phone' in d) && (d.phone is string) && (d.phone != '')) ) &&
+               ( nonEmptyStr(d, 'city') || nonEmptyStr(d, 'location') ) &&
+               nonEmptyStr(d, 'degree') &&
+               (('experience' in d) && (d.experience is number)) &&
+               nonEmptyStr(d, 'bio');
+      }
+      function validUserOnCreate() {
+        let d = request.resource.data;
+        return therapistValidOnCreate(d) || patientValidOnCreate(d);
+      }
+
+      // Per-document reads
+      allow get: if isSignedIn() &&
+                 (request.auth.uid == userId ||
+                  isApprovedTherapistDoc() ||
+                  hasPairWith(userId));
+
+      // Queries: allowed for signed-in; each returned doc must also satisfy the get rule above
+      allow list: if isSignedIn();
+
+      // Writes remain self-only; on create, enforce required fields by role
+      allow create: if isSignedIn() && request.auth.uid == userId && validUserOnCreate();
+      allow update, delete: if isSignedIn() && request.auth.uid == userId;
+
+      // Subcollections under users/{userId} (e.g., moods)
+      // Patients own their data; therapists with a pair can read (but not write)
+      match /{subcollection=**} {
+        allow read: if isSignedIn() && (request.auth.uid == userId || hasPairWith(userId));
+        allow write: if isSignedIn() && request.auth.uid == userId;
+      }
+    }
+
+    // Therapists collection - Option B (signed-in users can read, therapist writes self)
+    match /therapists/{therapistId} {
+      allow list, get: if isSignedIn();
+      allow create, update, delete: if isSignedIn() && request.auth.uid == therapistId;
+    }
+
+    // Pair map: patientTherapistPairs/{pairId} with fields: therapistId, patientId, status, ...
+    match /patientTherapistPairs/{pairId} {
+      // Read if the signed-in user is part of the pair
+      // Use resource.data so it evaluates cleanly for both get and list queries
+      allow read: if isSignedIn() && (
+        resource.data.therapistId == request.auth.uid ||
+        resource.data.patientId == request.auth.uid
+      );
+
+      // Create/merge by either party creating the relationship (patient request or therapist accept)
+      allow create: if isSignedIn() &&
+        (request.resource.data.therapistId == request.auth.uid ||
+         request.resource.data.patientId == request.auth.uid);
+
+      // Update by either party in the existing pair
+      allow update: if isSignedIn() && (
+        resource.data.therapistId == request.auth.uid ||
+        resource.data.patientId == request.auth.uid
+      );
+
+      // Prevent delete except by therapist (optional; relax if needed)
+      allow delete: if isSignedIn() && resource.data.therapistId == request.auth.uid;
+    }
+
+    // Chat: therapistChats/{chatId}/messages/{messageId}
+    // Allow read/write if the chatId corresponds to an existing pair and the user is part of that pair
+    match /therapistChats/{chatId}/messages/{messageId} {
+      allow read, write: if isSignedIn() &&
+        exists(/databases/$(database)/documents/patientTherapistPairs/$(chatId)) &&
+        (
+          get(/databases/$(database)/documents/patientTherapistPairs/$(chatId)).data.therapistId == request.auth.uid ||
+          get(/databases/$(database)/documents/patientTherapistPairs/$(chatId)).data.patientId == request.auth.uid
+        );
+    }
+
+    // Call requests/bookings - authenticated users can write, therapists can read their own
+    match /callRequests/{document} {
+      allow read: if isSignedIn() &&
+        (
+          resource == null ||
+          resource.data.uid == request.auth.uid ||
+          resource.data.therapistId == request.auth.uid ||
+          exists(/databases/$(database)/documents/therapists/$(request.auth.uid))
+        );
+      allow write: if isSignedIn();
+    }
+
+    // Community post interactions (likes/comments)
+    match /communityPosts/{postId}/interactions/{document} {
+      allow read: if true;
+      allow write: if isSignedIn();
+    }
+  }
+}
